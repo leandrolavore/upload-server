@@ -8,26 +8,11 @@ const uploadsInProgress = {}; // To track uploads in progress
 app.post('/upload', async (req, res) => {
   try {
     const filename = req.headers['x-filename'] || 'uploaded-file';
-    console.log("filename", filename);
-
     const contentRange = req.headers['content-range'];
 
     if (!contentRange) {
       return res.status(400).send('Content-Range header is required');
     }
-    console.log("contentRange", contentRange);
-
-    const contentLength = req.headers['content-length'];
-
-    if (!contentLength) {
-      return res.status(400).send('Content-Range header is required');
-    }
-    console.log("contentLength", contentLength);
-
-    console.log("filename:", filename);
-    console.log("contentRange:", contentRange);
-    console.log("contentLength:", contentLength);
-
 
     const range = contentRange.match(/bytes (\d+)-(\d+)\/(\d+|\*)/);
     if (!range) {
@@ -37,43 +22,58 @@ app.post('/upload', async (req, res) => {
     const start = parseInt(range[1], 10); // Start byte of the chunk
     const end = parseInt(range[2], 10); // End byte of the chunk
     const total = range[3] === '*' ? null : parseInt(range[3], 10); // Total file size
-
     const uploadPath = path.join(__dirname, filename);
 
-    // Track the upload progress
+    // Ensure the directory exists
+    const uploadDir = path.dirname(uploadPath);
+    await fs.promises.mkdir(uploadDir, { recursive: true });
+
+    // Initialize or update tracking for the upload
     if (!uploadsInProgress[filename]) {
       uploadsInProgress[filename] = {
         bytesReceived: 0,
         totalSize: total,
       };
 
-      if (total) {
-        // Use truncate to preallocate file size
-        await fs.promises.truncate(uploadPath, total);
-        console.log(`Preallocated file ${filename} with size ${total} bytes`);
+      console.log(`Started new upload: ${filename}, total size: ${total}`);
+    }
+
+    const uploadInfo = uploadsInProgress[filename];
+
+    // Open or create the file
+    let fileHandle;
+    try {
+      fileHandle = await fs.promises.open(uploadPath, 'r+'); // Open for reading and writing
+    } catch (err) {
+      if (err.code === 'ENOENT') {
+        console.log(`File not found, creating new file: ${uploadPath}`);
+        fileHandle = await fs.promises.open(uploadPath, 'a+'); // Create if it doesn't exist
       } else {
-        // Create an empty file for unknown total size
-        await fs.promises.writeFile(uploadPath, Buffer.alloc(0));
-        console.log(`Created empty file ${filename}`);
+        throw err;
       }
     }
 
-    const fileHandle = await fs.promises.open(uploadPath, 'r+');
+    // Buffer to hold incoming data
     const buffer = [];
 
-    req.on('data', chunk => buffer.push(chunk));
+    req.on('data', (chunk) => buffer.push(chunk));
+
     req.on('end', async () => {
       const data = Buffer.concat(buffer);
+
+      // Write the data to the file at the correct position
       await fileHandle.write(data, 0, data.length, start);
       await fileHandle.close();
 
-      uploadsInProgress[filename].bytesReceived += data.length;
-      if (total) uploadsInProgress[filename].totalSize = total;
+      // Update the tracking info
+      uploadInfo.bytesReceived += data.length;
 
       console.log(`Received chunk: ${start}-${end}`);
-      console.log(`Total received: ${uploadsInProgress[filename].bytesReceived}/${total}`);
+      console.log(
+        `Total received for ${filename}: ${uploadInfo.bytesReceived}/${uploadInfo.totalSize}`
+      );
 
-      if (uploadsInProgress[filename].totalSize && uploadsInProgress[filename].bytesReceived >= total) {
+      if (uploadInfo.totalSize && uploadInfo.bytesReceived >= uploadInfo.totalSize) {
         console.log(`Upload complete for ${filename}`);
         delete uploadsInProgress[filename];
         res.status(200).send('File uploaded completely');
@@ -81,9 +81,10 @@ app.post('/upload', async (req, res) => {
         res.status(200).send('Chunk uploaded successfully');
       }
     });
+
     req.on('error', async (err) => {
-      console.error('Error during upload:', err);
-      await fileHandle.close();
+      console.error(`Error during upload for ${filename}:`, err);
+      await fileHandle?.close();
       res.status(500).send('Upload failed');
     });
   } catch (err) {
@@ -91,7 +92,6 @@ app.post('/upload', async (req, res) => {
     res.status(500).send('Upload failed');
   }
 });
-
 app.listen(8080, () => {
   console.log('Server is listening on port 8080');
 });
